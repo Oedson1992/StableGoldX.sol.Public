@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.10;
+
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/ERC20.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/access/Ownable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/security/ReentrancyGuard.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/security/Pausable.sol";
+
+contract StableGoldX is ERC20, Ownable, ReentrancyGuard, Pausable {
+    // ====== RESERVAS E LIMITES ======
+    uint256 public goldReserve;
+    uint256 public btcReserve;
+    uint256 public ethReserve;
+
+    // Cooldowns baseados em blocos (inspirados no Bitcoin PoW)
+    uint256 public constant WITHDRAWAL_COOLDOWN_BLOCKS = 600; // ~1 hora (similar ao tempo médio de bloco do Bitcoin)
+    uint256 public constant GLOBAL_COOLDOWN_BLOCKS = 120; // ~10 minutos (prevenção de ataques DDoS)
+
+    // Limites de saque (prevenção de ataques de drenagem)
+    uint256 public maxWithdrawal;
+    uint256 public constant DAILY_WITHDRAWAL_LIMIT = 5000 * 10**18; // Limite diário em tokens (ajustado para 18 decimais)
+    uint256 public constant MAX_DAILY_WITHDRAWALS = 3; // Máximo de saques diários
+
+    // Limites de depósito (prevenção de lavagem de dinheiro)
+    uint256 public constant MIN_DEPOSIT_AMOUNT = 1 * 10**18;
+    uint256 public constant MAX_DEPOSIT_AMOUNT = 10000 * 10**18;
+
+    // ====== ESTRUTURA DE DADOS (inspirada na segurança do Bitcoin) ======
+    struct WithdrawalInfo {
+        uint256 lastWithdrawalBlock; // Timestamp do último saque (baseado em blocos)
+        uint256 dailyWithdrawalAmount; // Total sacado no dia
+        uint256 lastDepositBlock; // Bloco do último depósito (prevenção de ataques Sybil)
+        uint256 dailyWithdrawals; // Contador de saques diários
+    }
+
+    mapping(address => WithdrawalInfo) public userWithdrawals;
+
+    // ====== MECANISMO DE CONSENSO (similar à governança do Bitcoin) ======
+    uint256 public approverCount;
+    bool public withdrawalLocked; // Trava de emergência (como um "circuit breaker")
+    uint256 public lastGlobalWithdrawalBlock; // Último saque global (prevenção de ataques coordenados)
+
+    address[] public approvers;
+    mapping(address => bool) public isApprover;
+    uint256 public requiredApprovals; // Mínimo de assinaturas necessárias (similar a multisig)
+
+    // ====== EVENTOS (auditoria transparente, como a blockchain do Bitcoin) ======
+    event GoldDeposited(uint256 amount);
+    event GoldWithdrawn(uint256 amount);
+    event BTCDeposited(uint256 amount);
+    event BTCWithdrawn(uint256 amount);
+    event ETHDeposited(uint256 amount);
+    event ETHWithdrawn(uint256 amount);
+    event MaxWithdrawalUpdated(uint256 newMaxWithdrawal);
+    event WithdrawalLocked(bool locked);
+    event NewApproverAdded(address approver);
+    event ApproverRemoved(address approver);
+
+    // ====== CONSTRUTOR (configuração inicial, similar ao "genesis block" do Bitcoin) ======
+    constructor(uint256 initialMaxWithdrawal, uint256 _requiredApprovals) 
+        ERC20("Stable GoldX", "SGX") 
+        Ownable() 
+    {
+        maxWithdrawal = initialMaxWithdrawal;
+        requiredApprovals = _requiredApprovals;
+        approvers.push(msg.sender);
+        isApprover[msg.sender] = true;
+        approverCount = 1;
+    }
+
+    // ====== MODIFICADORES (segurança adicional) ======
+    modifier onlyApprover() {
+        require(isApprover[msg.sender], "StableGoldX: Not an approver");
+        _;
+    }
+
+    // ====== FUNÇÕES DE DEPÓSITO (com validação rígida) ======
+    function depositGold(uint256 goldAmount) external onlyOwner whenNotPaused {
+        require(goldAmount >= MIN_DEPOSIT_AMOUNT, "StableGoldX: Deposit too small");
+        require(goldAmount <= MAX_DEPOSIT_AMOUNT, "StableGoldX: Deposit exceeds limit");
+
+        goldReserve += goldAmount;
+        _mint(msg.sender, goldAmount);
+        emit GoldDeposited(goldAmount);
+    }
+
+    function depositBTC(uint256 btcAmount) external onlyOwner whenNotPaused {
+        require(btcAmount > 0, "StableGoldX: Amount must be > 0");
+        btcReserve += btcAmount;
+        emit BTCDeposited(btcAmount);
+    }
+
+    function depositETH(uint256 ethAmount) external onlyOwner whenNotPaused {
+        require(ethAmount > 0, "StableGoldX: Amount must be > 0");
+        ethReserve += ethAmount;
+        emit ETHDeposited(ethAmount);
+    }
+
+    // ====== FUNÇÕES DE SAQUE (com proteções contra ataques) ======
+    function withdrawGold(uint256 tokenAmount) external nonReentrant whenNotPaused {
+        require(!withdrawalLocked, "StableGoldX: Withdrawals locked");
+        require(tokenAmount > 0, "StableGoldX: Amount must be > 0");
+        require(balanceOf(msg.sender) >= tokenAmount, "StableGoldX: Insufficient balance");
+        require(goldReserve >= tokenAmount, "StableGoldX: Insufficient reserve");
+
+        WithdrawalInfo storage user = userWithdrawals[msg.sender];
+
+        // Verificação de cooldown (similar ao tempo de confirmação do Bitcoin)
+        require(block.number >= user.lastWithdrawalBlock + WITHDRAWAL_COOLDOWN_BLOCKS, "StableGoldX: Cooldown active");
+        require(user.dailyWithdrawalAmount + tokenAmount <= DAILY_WITHDRAWAL_LIMIT, "StableGoldX: Daily limit exceeded");
+        require(user.dailyWithdrawals < MAX_DAILY_WITHDRAWALS, "StableGoldX: Max withdrawals reached");
+        require(block.number >= lastGlobalWithdrawalBlock + GLOBAL_COOLDOWN_BLOCKS, "StableGoldX: Global cooldown");
+        require(block.number > user.lastDepositBlock + 5760, "StableGoldX: Deposit cooldown (48h)");
+
+        _burn(msg.sender, tokenAmount);
+        goldReserve -= tokenAmount;
+
+        // Atualiza os registros do usuário (similar a UTXOs no Bitcoin)
+        user.lastWithdrawalBlock = block.number;
+        user.dailyWithdrawalAmount += tokenAmount;
+        user.dailyWithdrawals += 1;
+        lastGlobalWithdrawalBlock = block.number;
+
+        emit GoldWithdrawn(tokenAmount);
+    }
+
+    function withdrawBTC(uint256 btcAmount) external onlyOwner nonReentrant whenNotPaused {
+        require(btcReserve >= btcAmount, "StableGoldX: Insufficient BTC reserve");
+        btcReserve -= btcAmount;
+        emit BTCWithdrawn(btcAmount);
+    }
+
+    function withdrawETH(uint256 ethAmount) external onlyOwner nonReentrant whenNotPaused {
+        require(ethReserve >= ethAmount, "StableGoldX: Insufficient ETH reserve");
+        ethReserve -= ethAmount;
+        emit ETHWithdrawn(ethAmount);
+    }
+
+    // ====== GOVERNANÇA DESCENTRALIZADA (similar a BIPs no Bitcoin) ======
+    function addApprover(address newApprover) external onlyOwner {
+        require(!isApprover[newApprover], "StableGoldX: Already approver");
+        approvers.push(newApprover);
+        isApprover[newApprover] = true;
+        approverCount++;
+        emit NewApproverAdded(newApprover);
+    }
+
+    function removeApprover(address approver) external onlyOwner {
+        require(isApprover[approver], "StableGoldX: Not approver");
+        isApprover[approver] = false;
+        approverCount--;
+        emit ApproverRemoved(approver);
+    }
+
+    function setRequiredApprovals(uint256 _requiredApprovals) external onlyOwner {
+        requiredApprovals = _requiredApprovals;
+    }
+
+    // ====== ATUALIZAÇÃO DE PARÂMETROS (com consenso multi-assinatura) ======
+    function updateMaxWithdrawal(uint256 newMaxWithdrawal) external onlyApprover {
+        require(approverCount >= requiredApprovals, "StableGoldX: Not enough approvals");
+        maxWithdrawal = newMaxWithdrawal;
+        emit MaxWithdrawalUpdated(newMaxWithdrawal);
+    }
+
+    // ====== TRAVAS DE EMERGÊNCIA (como proteção contra exploits) ======
+    function setWithdrawalLock(bool locked) external onlyOwner {
+        withdrawalLocked = locked;
+        emit WithdrawalLocked(locked);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+}
