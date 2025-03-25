@@ -1,0 +1,5 @@
+# Ignora todos os .log dentro de /logs
+logs/*.log
+git add -f arquivo_ignorado.env
+npx hardhat init
+forge init
