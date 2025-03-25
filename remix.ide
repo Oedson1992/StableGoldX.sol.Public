@@ -1,0 +1,26 @@
+.gitignore
+# Diretórios de dependências
+node_modules/
+build/
+cache/
+artifacts/
+typechain-types/
+
+# Arquivos de ambiente (chaves privadas)
+.env
+.secret
+
+# IDE/Editor
+.vscode/
+.idea/
+
+# Arquivos temporários
+*.log
+*.tmp
+
+# Arquivos de debug
+*.debug.json
+
+# Hardhat / Foundry
+coverage/
+.gas-snapshot
